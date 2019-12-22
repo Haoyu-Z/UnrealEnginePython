@@ -47,7 +47,6 @@ const char *ue4_module_options = "linux_global_symbols";
 #include "Android/AndroidApplication.h"
 #endif
 
-
 const char *UEPyUnicode_AsUTF8(PyObject *py_str)
 {
 #if PY_MAJOR_VERSION < 3
@@ -239,10 +238,207 @@ FAutoConsoleCommand ExecPythonStringCommand(
 	*NSLOCTEXT("UnrealEnginePython", "CommandText_Cmd", "Execute python string").ToString(),
 	FConsoleCommandWithArgsDelegate::CreateStatic(consoleExecString));
 
+bool FUnrealEnginePythonModule::LoadImportHookModule()
+{
+#if !WITH_EDITOR
+	FString ConfigImportHookModuleName;
+	if (!GConfig->GetString(UTF8_TO_TCHAR("Python"), UTF8_TO_TCHAR("PythonImportHookModule"), ConfigImportHookModuleName, GEngineIni))
+	{
+		return false;
+	}
+
+	char* ImportHookModuleName = TCHAR_TO_ANSI(*ConfigImportHookModuleName);
+	PyObject* ModuleLoadTuple = LoadFromPak(ImportHookModuleName);
+	PyObject* ExecResult = PyImport_ExecCodeModule(ImportHookModuleName, PyTuple_GetItem(ModuleLoadTuple, 2));
+	Py_DECREF(ModuleLoadTuple);
+
+	bool LoadResult = ExecResult != nullptr && ExecResult != Py_None;
+	Py_XDECREF(ExecResult);
+
+	return LoadResult;
+#else
+	return false;
+#endif
+}
+
+PyObject* FUnrealEnginePythonModule::LoadFromPak(char* FullName)
+{
+#if !WITH_EDITOR
+	FString PakFilePath = FPaths::Combine(*PROJECT_CONTENT_DIR, *PakPackageFileRelativePath);
+	FPaths::RemoveDuplicateSlashes(PakFilePath);
+	if (!FPaths::FileExists(PakFilePath))
+	{
+		Py_RETURN_NONE;
+	}
+
+	FPakFile PakFile(&FPlatformFileManager::Get().GetPlatformFile(), *PakFilePath, false);
+	TCHAR* TFullName = ANSI_TO_TCHAR(FullName);
+
+	if (PakFile.IsValid())
+	{
+		FArchive& Reader = *PakFile.GetSharedReader(nullptr);
+		bool bFoundFile = false, bIsPythonPackage = false;
+		FPakEntry FindFileEntry;
+
+		for (const FString& ScriptPath : ConfigurationRelativePaths)
+		{
+			FString PackageFileNameToSearch = FPaths::Combine(*PROJECT_CONTENT_DIR, *ScriptPath, TFullName, TEXT("__init__.pyc"));
+			FPaths::RemoveDuplicateSlashes(PackageFileNameToSearch);
+			FString ModuleFileNameToSearch = FPaths::Combine(*PROJECT_CONTENT_DIR, *ScriptPath, TFullName).Append(TEXT(".pyc"), 4);
+			FPaths::RemoveDuplicateSlashes(ModuleFileNameToSearch);
+
+			if (PakFile.Find(PackageFileNameToSearch, &FindFileEntry) == FPakFile::EFindResult::Found)
+			{
+				bFoundFile = true;
+				bIsPythonPackage = true;
+			}
+
+			if (!bFoundFile)
+			{
+				if (PakFile.Find(ModuleFileNameToSearch, &FindFileEntry) == FPakFile::EFindResult::Found)
+				{
+					bFoundFile = true;
+					bIsPythonPackage = false;
+				}
+			}
+
+			if (bFoundFile)
+			{
+				const FPakEntry& Entry = FindFileEntry;
+				Reader.Seek(Entry.Offset);
+
+				FPakEntry EntryInfo;
+				EntryInfo.Serialize(Reader, PakFile.GetInfo().Version);
+
+				if (EntryInfo == Entry)
+				{
+					PyObject* LoadedCodeObject = LoadCodeObjectFromArchive(Reader, PakFile, Entry);
+					if (LoadedCodeObject == Py_None)
+					{
+						return LoadedCodeObject;
+					}
+
+					PyObject* ReturnInfo = PyTuple_New(3);
+					/*
+					 * Element[0]: Desired file's path in PAK archive.
+					 */
+					PyTuple_SetItem(ReturnInfo, 0, PyString_FromString(TCHAR_TO_ANSI(*((bIsPythonPackage ? PackageFileNameToSearch : ModuleFileNameToSearch) + FString(" in ") + PakFilePath))));
+					/*
+					 * Element[1]: Whether this is a Python package's __init__ file, or common module file.
+					 */
+					PyObject* BoolObject = bIsPythonPackage ? (Py_True) : (Py_False);
+					Py_INCREF(BoolObject);
+					PyTuple_SetItem(ReturnInfo, 1, BoolObject);
+					/*
+					 * Element[2]: PyCodeObject read from the PYC file.
+					 */
+					PyTuple_SetItem(ReturnInfo, 2, LoadedCodeObject);
+
+					return ReturnInfo;
+				}
+				break;
+			}
+		}
+	}
+	else
+	{
+		UE_LOG(LogPython, Error, TEXT("Specified scripts pack file is not valid, path is %s."), *PakFilePath);
+	}
+#endif
+	Py_RETURN_NONE;
+}
+
+#if !WITH_EDITOR
+void CheckMemorySize(void*& Memory, SIZE_T& OriginalSize, const SIZE_T& EnsureSize)
+{
+	check(Memory != nullptr);
+	if (OriginalSize < EnsureSize)
+	{
+		OriginalSize = FMath::Max<SIZE_T>(OriginalSize * 2, EnsureSize);
+		FMemory::Free(Memory);
+		Memory = FMemory::Malloc(OriginalSize);
+	}
+}
+
+
+PyObject* FUnrealEnginePythonModule::LoadCodeObjectFromArchive(FArchive& Reader, FPakFile& PakFile, const FPakEntry& Entry)
+{
+	static const int PY_CODE_OBJECT_OFFSET = 8;
+
+	if (Entry.IsEncrypted())
+	{
+		UE_LOG(LogPython, Error, TEXT("Extraction of encrypted .Pak files is not implemented."));
+		Py_RETURN_NONE;
+	}
+
+	PyObject* CodeObject = nullptr;
+	if (Entry.CompressionMethodIndex == 0)
+	{
+		if (Entry.Size < PY_CODE_OBJECT_OFFSET)
+		{
+			Py_RETURN_NONE;
+		}
+		CheckMemorySize(SerializationMemory, SerializationMemorySize, Entry.Size);
+		Reader.Serialize(SerializationMemory, Entry.Size);
+		CodeObject = PyMarshal_ReadObjectFromString(reinterpret_cast<char*>(SerializationMemory) + PY_CODE_OBJECT_OFFSET, Entry.Size - PY_CODE_OBJECT_OFFSET);
+	}
+	else
+	{
+		if (Entry.UncompressedSize < PY_CODE_OBJECT_OFFSET)
+		{
+			Py_RETURN_NONE;
+		}
+
+		FName CompressionFormat = PakFile.GetInfo().GetCompressionMethod(Entry.CompressionMethodIndex);
+		int32 MaxCompressionBlockSize = FCompression::CompressMemoryBound(CompressionFormat, Entry.CompressionBlockSize);
+		for (const FPakCompressedBlock& CompressedBlock : Entry.CompressionBlocks)
+		{
+			MaxCompressionBlockSize = FMath::Max<int32>(MaxCompressionBlockSize, CompressedBlock.CompressedEnd - CompressedBlock.CompressedStart);
+		}
+
+		int64 UncompressionWorkingSize = Entry.CompressionBlockSize + MaxCompressionBlockSize;
+		CheckMemorySize(UncompressionMemory, UncompressionMemorySize, UncompressionWorkingSize);
+		CheckMemorySize(SerializationMemory, SerializationMemorySize, Entry.UncompressedSize);
+
+		void* CompressedBuffer = UncompressionMemory,
+			* UncompressedBuffer = reinterpret_cast<void*>(reinterpret_cast<uint8*>(CompressedBuffer) + MaxCompressionBlockSize),
+			* SerializationBuffer = SerializationMemory;
+
+		int BlockNumber = Entry.CompressionBlocks.Num();
+		for (int BlockIndex = 0; BlockIndex < BlockNumber; ++BlockIndex)
+		{
+			const FPakCompressedBlock& CompressedBlock = Entry.CompressionBlocks[BlockIndex];
+			uint32 CompressedBlockSize = CompressedBlock.CompressedEnd - CompressedBlock.CompressedStart;
+			uint32 UncompressedBlockSize = (uint32)FMath::Min<int64>(Entry.UncompressedSize - Entry.CompressionBlockSize * BlockIndex, Entry.CompressionBlockSize);
+			Reader.Seek(CompressedBlock.CompressedStart + (PakFile.GetInfo().HasRelativeCompressedChunkOffsets() ? Entry.Offset : 0));
+			Reader.Serialize(CompressedBuffer, CompressedBlockSize);
+
+			if (!FCompression::UncompressMemory(CompressionFormat, UncompressedBuffer, UncompressedBlockSize, CompressedBuffer, CompressedBlockSize))
+			{
+				Py_RETURN_NONE;
+			}
+
+			FMemory::Memcpy(SerializationBuffer, UncompressedBuffer, UncompressedBlockSize);
+			SerializationBuffer = reinterpret_cast<void*>(reinterpret_cast<uint8*>(SerializationBuffer) + UncompressedBlockSize);
+		}
+
+		CodeObject = PyMarshal_ReadObjectFromString(reinterpret_cast<char*>(SerializationMemory) + PY_CODE_OBJECT_OFFSET, Entry.UncompressedSize - PY_CODE_OBJECT_OFFSET);
+	}
+
+	return CodeObject;
+}
+#endif
 
 void FUnrealEnginePythonModule::StartupModule()
 {
 	BrutalFinalize = false;
+
+#if !WITH_EDITOR
+	SerializationMemorySize = INITIAL_SERIALIZATION_MEMORY_SIZE;
+	UncompressionMemorySize = INITIAL_UNCOMPRESSION_MEMORY_SIZE;
+	SerializationMemory = FMemory::Malloc(SerializationMemorySize);
+	UncompressionMemory = FMemory::Malloc(UncompressionMemorySize);
+#endif
 
 	// This code will execute after your module is loaded into memory; the exact timing is specified in the .uplugin file per-module
 	FString PythonHome;
@@ -302,9 +498,13 @@ void FUnrealEnginePythonModule::StartupModule()
 		ScriptsPaths.Add(IniValue);
 	}
 
-	if (GConfig->GetString(UTF8_TO_TCHAR("Python"), UTF8_TO_TCHAR("RelativeScriptsPath"), IniValue, GEngineIni))
+	if (GConfig->GetSingleLineArray(UTF8_TO_TCHAR("Python"), UTF8_TO_TCHAR("RelativeScriptsPath"), ConfigurationRelativePaths, GEngineIni))
 	{
-		ScriptsPaths.Add(FPaths::Combine(*PROJECT_CONTENT_DIR, *IniValue));
+		for (FString RelativePath : ConfigurationRelativePaths)
+		{
+			FString FullPath = FPaths::Combine(*PROJECT_CONTENT_DIR, *RelativePath);
+			ScriptsPaths.Add(FullPath);
+		}
 	}
 
 	if (GConfig->GetString(UTF8_TO_TCHAR("Python"), UTF8_TO_TCHAR("AdditionalModulesPath"), IniValue, GEngineIni))
@@ -332,6 +532,19 @@ void FUnrealEnginePythonModule::StartupModule()
 		const TCHAR* separators[] = { TEXT(" "), TEXT(";"), TEXT(",") };
 		IniValue.ParseIntoArray(ImportModules, separators, 3);
 	}
+
+#if !WITH_EDITOR
+	if (GConfig->GetString(UTF8_TO_TCHAR("Python"), UTF8_TO_TCHAR("PythonPackageName"), IniValue, GEngineIni))
+	{
+		PakPackageFileRelativePath = FString::Format(TEXT("Paks/{0}-{1}.pak"), { FStringFormatArg(IniValue), FStringFormatArg(FPlatformProperties::PlatformName) });
+	}
+	else
+	{
+		PakPackageFileRelativePath.Empty();
+	}
+
+	UE_LOG(LogPython, Log, TEXT("PakPackageFileRelativePath=%s"), *PakPackageFileRelativePath);
+#endif
 
 	FString ProjectScriptsPath = FPaths::Combine(*PROJECT_CONTENT_DIR, UTF8_TO_TCHAR("Scripts"));
 	if (!FPaths::DirectoryExists(ProjectScriptsPath))
@@ -496,6 +709,8 @@ void FUnrealEnginePythonModule::StartupModule()
 
 	setup_stdout_stderr();
 
+	LoadImportHookModule();
+
 	if (PyImport_ImportModule("ue_site"))
 	{
 		UE_LOG(LogPython, Log, TEXT("ue_site Python module successfully imported"));
@@ -538,6 +753,14 @@ void FUnrealEnginePythonModule::ShutdownModule()
 {
 	// This function may be called during shutdown to clean up your module.  For modules that support dynamic reloading,
 	// we call this function before unloading the module.
+	ConfigurationRelativePaths.Empty();
+
+#if !WITH_EDITOR
+	FMemory::Free(SerializationMemory);
+	FMemory::Free(UncompressionMemory);
+	SerializationMemorySize = 0;
+	UncompressionMemorySize = 0;
+#endif
 
 	UE_LOG(LogPython, Log, TEXT("Goodbye Python"));
 	if (!BrutalFinalize)

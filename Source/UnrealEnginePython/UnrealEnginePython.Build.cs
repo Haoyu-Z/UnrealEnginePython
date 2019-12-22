@@ -8,9 +8,9 @@ public class UnrealEnginePython : ModuleRules
 {
 
     // leave this string as empty for triggering auto-discovery of python installations...
-    private string pythonHome = "";
+    // private string pythonHome = "";
     // otherwise specify the path of your python installation
-    //private string pythonHome = "C:/Program Files/Python36";
+    private string pythonHome = "C:/Program Files/Python27";
     // this is an example for Homebrew on Mac
     //private string pythonHome = "/usr/local/Cellar/python3/3.6.0/Frameworks/Python.framework/Versions/3.6/";
     // on Linux an include;libs syntax is expected:
