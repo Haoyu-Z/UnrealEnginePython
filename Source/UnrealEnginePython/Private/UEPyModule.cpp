@@ -224,7 +224,20 @@ static PyObject* py_unreal_engine_set_brutal_finalize(PyObject* self, PyObject* 
 	Py_RETURN_NONE;
 }
 
+static PyObject* py_unreal_engine_load_module_from_pak(PyObject* self, PyObject* args)
+{
+	char* module_name = nullptr;
+	if (!PyArg_ParseTuple(args, "s", &module_name))
+	{
+		return nullptr;
+	}
+
+	return FModuleManager::GetModuleChecked<FUnrealEnginePythonModule>("UnrealEnginePython").LoadFromPak(module_name);
+}
+
 static PyMethodDef unreal_engine_methods[] = {
+	{"load_module_from_pak", py_unreal_engine_load_module_from_pak, METH_VARARGS, "" },
+
 	{ "log", py_unreal_engine_log, METH_VARARGS, "" },
 	{ "log_warning", py_unreal_engine_log_warning, METH_VARARGS, "" },
 	{ "log_error", py_unreal_engine_log_error, METH_VARARGS, "" },

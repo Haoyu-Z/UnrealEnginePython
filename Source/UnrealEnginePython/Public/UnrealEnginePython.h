@@ -33,6 +33,14 @@
 #include <include/structmember.h>
 #endif
 
+#if !WITH_EDITOR
+#include <PlatformFileManager.h>
+#include <PlatformFile.h>
+#include <IPlatformFilePak.h>
+#include <Misc/Paths.h>
+#include <include/marshal.h>
+#endif
+
 typedef struct
 {
 	PyObject_HEAD
@@ -99,6 +107,23 @@ DECLARE_LOG_CATEGORY_EXTERN(LogPython, Log, All);
 
 class UNREALENGINEPYTHON_API FUnrealEnginePythonModule : public IModuleInterface
 {
+private:
+	bool LoadImportHookModule();
+#if !WITH_EDITOR
+#define PYTHON_IMPORT_HOOK_MODULE_NAME "pyue_importer"
+#define PAK_PACKAGE_FILE_RELATIVE_PATH "Paks/ScriptsPack.pak"
+#define INITIAL_SERIALIZATION_MEMORY_SIZE 16 * 1024
+#define INITIAL_UNCOMPRESSION_MEMORY_SIZE 32 * 1024
+	void* SerializationMemory;
+	void* UncompressionMemory;
+	SIZE_T SerializationMemorySize;
+	SIZE_T UncompressionMemorySize;
+
+	PyObject* LoadCodeObjectFromArchive(FArchive& Reader, FPakFile& PakFile, const FPakEntry& Entry);
+#endif
+public:
+	PyObject* LoadFromPak(char* FullName);
+
 public:
 
 	virtual void StartupModule() override;
@@ -114,6 +139,7 @@ public:
 
 	void UESetupPythonInterpreter(bool);
 
+	TArray<FString> ConfigurationRelativePaths;
 	TArray<FString> ScriptsPaths;
 	FString ZipPath;
 	FString AdditionalModulesPath;
